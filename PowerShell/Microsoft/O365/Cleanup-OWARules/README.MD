@@ -2,6 +2,7 @@
 This PowerShell script is designed to clean up erroring OWA (Outlook Web App) rules from user mailboxes in Exchange Online. It connects to Exchange Online, retrieves all user mailboxes, identifies erroring OWA rules, and removes them.
 ## Prerequisites
 * Windows PowerShell 5.1 or later
+* Exchange Admin Permissions
 * Exchange Online Management Module installed
 To install the Exchange Online Management Module, open PowerShell as an administrator and run:
 `Install-Module -Name ExchangeOnlineManagement`
