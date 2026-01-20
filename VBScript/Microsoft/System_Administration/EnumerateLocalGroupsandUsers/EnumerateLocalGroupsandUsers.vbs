@@ -3,7 +3,7 @@ On Error Resume Next
 '	Semi-authored by Paul Karl Arthur Kell (paul@kellfamily.org).
 '	Most of this script has been quilted together from various freely available scripts on 
 '	the web.  Other parts have been added specifically by myself to address specific needs.
-'	It has been created to automate tasks at the KapHI Refinery.  Script MUST be run using 
+'	It has been created to automate tasks.  Script MUST be run using 
 '	wscript.exe.  DO NOT USE cscript.  This script is public domain.
 
 '
