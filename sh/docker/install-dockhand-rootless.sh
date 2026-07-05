@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="install-dockhand-rootless"
-SCRIPT_VERSION="2026.07.05-r4"
+SCRIPT_VERSION="2026.07.05-r5"
 DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/paulkakell/Pauls_Big_Script_Repo/main/sh/docker/install-dockhand-rootless.sh"
 SCRIPT_URL="${SCRIPT_URL:-$DEFAULT_SCRIPT_URL}"
 LOCAL_SCRIPT="/usr/local/sbin/install-dockhand-rootless"
@@ -16,6 +16,8 @@ USE_DEFAULTS="no"
 ROLLBACK_ON_FAIL="unset"
 UPDATE_SELF="no"
 SHOW_HELP="no"
+LOW_PORTS_OVERRIDE="unset"
+LOW_PORT_START_OVERRIDE=""
 INSTALL_STAGE="start"
 TOTAL_STEPS=13
 CURRENT_STEP=0
@@ -48,6 +50,9 @@ Options:
   --script-url URL            Raw GitHub URL used by the self-update helper.
   --rollback                  Roll back the Dockhand compose stack if deployment fails.
   --no-rollback               Do not roll back on deployment failure.
+  --enable-low-ports          Allow rootless containers to publish ports below 1024.
+  --disable-low-ports         Do not change low-port binding sysctl settings.
+  --low-port-start PORT       Lowest unprivileged host port. Use 80 for HTTP/HTTPS, 0 for all.
   --update-self               Download this installer from SCRIPT_URL into $LOCAL_SCRIPT.
   -h, --help                  Show this help.
 
@@ -63,6 +68,8 @@ Environment overrides:
   DOCKHAND_IMAGE              Default: fnsys/dockhand:latest
   POSTGRES_IMAGE              Default: postgres:16-alpine
   POSTGRES_PASSWORD           Default: generated
+  ENABLE_LOW_PORTS            Default: yes
+  LOW_PORT_START              Default: 80
   SCRIPT_URL                  Default: $DEFAULT_SCRIPT_URL
 EOF
 }
@@ -82,6 +89,17 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-rollback)
       ROLLBACK_ON_FAIL="no"
+      ;;
+    --enable-low-ports)
+      LOW_PORTS_OVERRIDE="yes"
+      ;;
+    --disable-low-ports)
+      LOW_PORTS_OVERRIDE="no"
+      ;;
+    --low-port-start)
+      [[ $# -ge 2 ]] || { echo "--low-port-start requires a port number" >&2; exit 2; }
+      LOW_PORT_START_OVERRIDE="$2"
+      shift
       ;;
     --update-self)
       UPDATE_SELF="yes"
@@ -191,6 +209,12 @@ validate_port() {
   local value="$1"
   validate_numeric "Dockhand port" "$value"
   (( value >= 1 && value <= 65535 )) || fatal "Dockhand port must be between 1 and 65535."
+}
+
+validate_low_port_start() {
+  local value="$1"
+  validate_numeric "Low port start" "$value"
+  (( value >= 0 && value <= 1024 )) || fatal "Low port start must be between 0 and 1024. Use 80 for HTTP/HTTPS or 0 for all privileged ports."
 }
 
 apt_wait() {
@@ -359,11 +383,22 @@ validate_port "$DOCKHAND_PORT"
 [[ "$COMPOSE_PROJECT_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || fatal "Compose project name contains invalid characters."
 (( SUBUID_COUNT >= 65536 )) || fatal "subuid/subgid count must be at least 65536."
 
-if (( DOCKHAND_PORT < 1024 )); then
-  LOW_PORTS="$(ask_yes_no "Enable unprivileged binding for ports below 1024" "yes")"
+if [[ "$LOW_PORTS_OVERRIDE" != "unset" ]]; then
+  LOW_PORTS="$LOW_PORTS_OVERRIDE"
 else
-  LOW_PORTS="no"
+  LOW_PORTS="$(ask_yes_no "Enable rootless Docker publishing for low host ports such as 80 and 443" "${ENABLE_LOW_PORTS:-yes}")"
 fi
+
+if is_yes "$LOW_PORTS"; then
+  if [[ -n "$LOW_PORT_START_OVERRIDE" ]]; then
+    LOW_PORT_START="$LOW_PORT_START_OVERRIDE"
+  else
+    LOW_PORT_START="$(ask "Lowest unprivileged host port; 80 allows 80 and 443, 0 allows all privileged ports" "${LOW_PORT_START:-80}")"
+  fi
+else
+  LOW_PORT_START="1024"
+fi
+validate_low_port_start "$LOW_PORT_START"
 
 DOCKHAND_DATA_PATH="$INSTALL_PATH/data"
 POSTGRES_DATA_PATH="$INSTALL_PATH/postgres"
@@ -491,14 +526,21 @@ success "Prepared $HOST_PATH and $INSTALL_PATH."
 if is_yes "$LOW_PORTS"; then
   step "Enable low port binding for rootless containers"
   INSTALL_STAGE="low-ports"
-  cat >/etc/sysctl.d/99-rootless-docker-low-ports.conf <<'EOF'
-net.ipv4.ip_unprivileged_port_start=0
+  cat >/etc/sysctl.d/99-rootless-docker-low-ports.conf <<EOF
+# Created by $SCRIPT_NAME.
+# Required when rootless Docker publishes host ports below 1024, such as 80/443.
+# A value of 80 allows ports 80 and higher. Use 0 only when containers must bind ports 1-79.
+net.ipv4.ip_unprivileged_port_start=$LOW_PORT_START
 EOF
   sysctl --system >/dev/null
-  success "Rootless containers may publish ports below 1024."
+  CURRENT_LOW_PORT_START="$(sysctl -n net.ipv4.ip_unprivileged_port_start 2>/dev/null || echo unknown)"
+  if [[ "$CURRENT_LOW_PORT_START" != "$LOW_PORT_START" ]]; then
+    fatal "Failed to set net.ipv4.ip_unprivileged_port_start to $LOW_PORT_START. Current value: $CURRENT_LOW_PORT_START"
+  fi
+  success "Rootless containers may publish host ports >= $LOW_PORT_START, including 80 and 443 when LOW_PORT_START is 80 or lower."
 else
   step "Skip low port binding"
-  info "Dockhand is using port $DOCKHAND_PORT, so no low-port sysctl change is required."
+  info "Low-port binding was disabled. Rootless containers will need host ports >= 1024 unless the sysctl is configured separately."
 fi
 
 step "Create system service for the rootless Docker daemon"
@@ -676,6 +718,7 @@ Rootless Docker:
   User: $DOCKER_USER
   Socket: $DOCKER_SOCKET
   DOCKER_HOST: $DOCKER_HOST
+  Low-port binding: $LOW_PORTS, net.ipv4.ip_unprivileged_port_start=$LOW_PORT_START
 
 Run Docker manually as the rootless user:
   sudo -iu $DOCKER_USER
