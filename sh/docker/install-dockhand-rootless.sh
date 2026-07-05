@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="install-dockhand-rootless"
-SCRIPT_VERSION="2026.07.05-r5"
+SCRIPT_VERSION="2026.07.05-r6-networks"
 DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/paulkakell/Pauls_Big_Script_Repo/main/sh/docker/install-dockhand-rootless.sh"
 SCRIPT_URL="${SCRIPT_URL:-$DEFAULT_SCRIPT_URL}"
 LOCAL_SCRIPT="/usr/local/sbin/install-dockhand-rootless"
@@ -19,7 +19,7 @@ SHOW_HELP="no"
 LOW_PORTS_OVERRIDE="unset"
 LOW_PORT_START_OVERRIDE=""
 INSTALL_STAGE="start"
-TOTAL_STEPS=13
+TOTAL_STEPS=14
 CURRENT_STEP=0
 
 if [[ -t 1 ]]; then
@@ -70,6 +70,8 @@ Environment overrides:
   POSTGRES_PASSWORD           Default: generated
   ENABLE_LOW_PORTS            Default: yes
   LOW_PORT_START              Default: 80
+  DOCKHAND_INTERNAL_NETWORK   Default: dockhand-internal
+  CONTAINERS_EXTERNAL_NETWORK Default: containers-external
   SCRIPT_URL                  Default: $DEFAULT_SCRIPT_URL
 EOF
 }
@@ -217,6 +219,12 @@ validate_low_port_start() {
   (( value >= 0 && value <= 1024 )) || fatal "Low port start must be between 0 and 1024. Use 80 for HTTP/HTTPS or 0 for all privileged ports."
 }
 
+validate_docker_name() {
+  local label="$1"
+  local value="$2"
+  [[ "$value" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || fatal "$label contains an invalid Docker name: $value"
+}
+
 apt_wait() {
   local locks=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock)
   local waited=0
@@ -318,6 +326,59 @@ wait_for_rootless_docker() {
   fatal "Rootless Docker did not become ready."
 }
 
+ensure_docker_network() {
+  local network_name="$1"
+  local desired_internal="$2"
+  local current_internal=""
+  local create_args=(network create --driver bridge)
+
+  if [[ "$desired_internal" == "true" ]]; then
+    create_args+=(--internal)
+  fi
+
+  if as_docker_user docker network inspect "$network_name" >/dev/null 2>&1; then
+    current_internal="$(as_docker_user docker network inspect -f '{{.Internal}}' "$network_name")"
+    if [[ "$current_internal" != "$desired_internal" ]]; then
+      fatal "Docker network $network_name already exists with Internal=$current_internal. Expected Internal=$desired_internal. Remove or rename that network, then rerun the installer."
+    fi
+    info "Docker network $network_name already exists with Internal=$current_internal."
+  else
+    as_docker_user docker "${create_args[@]}" "$network_name" >/dev/null
+    success "Created Docker network $network_name with Internal=$desired_internal."
+  fi
+}
+
+prune_container_networks() {
+  local container="$1"
+  shift
+  local allowed=" $* "
+  local network=""
+
+  while IFS= read -r network; do
+    [[ -n "$network" ]] || continue
+    if [[ "$allowed" != *" $network "* ]]; then
+      as_docker_user docker network disconnect "$network" "$container" >/dev/null 2>&1 || true
+    fi
+  done < <(as_docker_user docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$container" 2>/dev/null || true)
+}
+
+assert_container_networks() {
+  local container="$1"
+  shift
+  local expected=""
+  local actual=""
+
+  expected="$(printf '%s
+' "$@" | LC_ALL=C sort | tr '
+' ' ' | sed 's/[[:space:]]*$//')"
+  actual="$(as_docker_user docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$container" | LC_ALL=C sort | tr '
+' ' ' | sed 's/[[:space:]]*$//')"
+
+  if [[ "$actual" != "$expected" ]]; then
+    fatal "$container network mismatch. Expected: ${expected:-none}. Actual: ${actual:-none}."
+  fi
+}
+
 write_user_shell_exports() {
   local bashrc profile marker_begin marker_end
   bashrc="$DOCKER_HOME/.bashrc"
@@ -363,6 +424,8 @@ HOST_DIR_MODE="$(ask "Host bind directory mode" "${HOST_DIR_MODE:-1777}")"
 DOCKHAND_IMAGE="$(ask "Dockhand image" "${DOCKHAND_IMAGE:-fnsys/dockhand:latest}")"
 POSTGRES_IMAGE="$(ask "PostgreSQL image" "${POSTGRES_IMAGE:-postgres:16-alpine}")"
 COMPOSE_PROJECT_NAME="$(ask "Compose project name" "${COMPOSE_PROJECT_NAME:-dockhand}")"
+DOCKHAND_INTERNAL_NETWORK="${DOCKHAND_INTERNAL_NETWORK:-dockhand-internal}"
+CONTAINERS_EXTERNAL_NETWORK="${CONTAINERS_EXTERNAL_NETWORK:-containers-external}"
 INSTALL_SELF_UPDATER="$(ask_yes_no "Install local self-update helper" "yes")"
 
 if [[ "$ROLLBACK_ON_FAIL" == "unset" ]]; then
@@ -381,6 +444,9 @@ validate_abs_path "Dockhand install path" "$INSTALL_PATH"
 validate_port "$DOCKHAND_PORT"
 [[ "$HOST_DIR_MODE" =~ ^[0-7]{3,4}$ ]] || fatal "Host bind directory mode must be an octal mode, such as 1777 or 0777."
 [[ "$COMPOSE_PROJECT_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || fatal "Compose project name contains invalid characters."
+validate_docker_name "Dockhand internal network" "$DOCKHAND_INTERNAL_NETWORK"
+validate_docker_name "Containers external network" "$CONTAINERS_EXTERNAL_NETWORK"
+[[ "$DOCKHAND_INTERNAL_NETWORK" != "$CONTAINERS_EXTERNAL_NETWORK" ]] || fatal "The internal and external Docker networks must use different names."
 (( SUBUID_COUNT >= 65536 )) || fatal "subuid/subgid count must be at least 65536."
 
 if [[ "$LOW_PORTS_OVERRIDE" != "unset" ]]; then
@@ -607,6 +673,8 @@ as_docker_user docker context use rootless >/dev/null 2>&1 || true
   printf 'INSTALL_PATH=%q\n' "$INSTALL_PATH"
   printf 'DOCKHAND_PORT=%q\n' "$DOCKHAND_PORT"
   printf 'COMPOSE_PROJECT_NAME=%q\n' "$COMPOSE_PROJECT_NAME"
+  printf 'DOCKHAND_INTERNAL_NETWORK=%q\n' "$DOCKHAND_INTERNAL_NETWORK"
+  printf 'CONTAINERS_EXTERNAL_NETWORK=%q\n' "$CONTAINERS_EXTERNAL_NETWORK"
 } > "$CONF_FILE"
 chmod 0644 "$CONF_FILE"
 
@@ -614,6 +682,12 @@ if is_yes "$INSTALL_SELF_UPDATER"; then
   install_update_helper
 fi
 success "Wrote $CONF_FILE."
+
+step "Create required Dockhand Docker networks"
+INSTALL_STAGE="networks"
+ensure_docker_network "$DOCKHAND_INTERNAL_NETWORK" "true"
+ensure_docker_network "$CONTAINERS_EXTERNAL_NETWORK" "false"
+success "Dockhand will use only $DOCKHAND_INTERNAL_NETWORK and $CONTAINERS_EXTERNAL_NETWORK."
 
 step "Write Dockhand compose files"
 INSTALL_STAGE="compose"
@@ -625,6 +699,8 @@ chmod 0600 "$PASSWORD_FILE"
 cat > "$ENV_FILE" <<EOF
 COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME
 POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+DOCKHAND_INTERNAL_NETWORK=$DOCKHAND_INTERNAL_NETWORK
+CONTAINERS_EXTERNAL_NETWORK=$CONTAINERS_EXTERNAL_NETWORK
 EOF
 chown "$DOCKER_USER:$DOCKER_GROUP" "$ENV_FILE"
 chmod 0600 "$ENV_FILE"
@@ -643,6 +719,8 @@ services:
       - type: bind
         source: "$POSTGRES_DATA_PATH"
         target: /var/lib/postgresql/data
+    networks:
+      dockhand-internal: {}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U dockhand -d dockhand"]
       interval: 10s
@@ -669,9 +747,20 @@ services:
       - type: bind
         source: "$DOCKHAND_DATA_PATH"
         target: "$DOCKHAND_DATA_PATH"
+    networks:
+      dockhand-internal: {}
+      containers-external: {}
     depends_on:
       postgres:
         condition: service_healthy
+
+networks:
+  dockhand-internal:
+    name: "$DOCKHAND_INTERNAL_NETWORK"
+    external: true
+  containers-external:
+    name: "$CONTAINERS_EXTERNAL_NETWORK"
+    external: true
 EOF
 chown "$DOCKER_USER:$DOCKER_GROUP" "$COMPOSE_FILE"
 chmod 0640 "$COMPOSE_FILE"
@@ -679,7 +768,7 @@ success "Wrote $COMPOSE_FILE."
 
 step "Deploy Dockhand and PostgreSQL"
 INSTALL_STAGE="deploy"
-as_docker_user bash -lc 'cd "$1" && docker compose pull && docker compose up -d' _ "$INSTALL_PATH"
+as_docker_user bash -lc 'cd "$1" && docker compose pull && docker compose up -d --remove-orphans' _ "$INSTALL_PATH"
 
 step "Verify deployment"
 INSTALL_STAGE="verify"
@@ -694,6 +783,13 @@ for i in {1..90}; do
     fatal "Dockhand containers did not reach running state."
   fi
 done
+
+prune_container_networks "dockhand-postgres" "$DOCKHAND_INTERNAL_NETWORK"
+prune_container_networks "dockhand" "$DOCKHAND_INTERNAL_NETWORK" "$CONTAINERS_EXTERNAL_NETWORK"
+as_docker_user docker network rm "${COMPOSE_PROJECT_NAME}_default" >/dev/null 2>&1 || true
+assert_container_networks "dockhand-postgres" "$DOCKHAND_INTERNAL_NETWORK"
+assert_container_networks "dockhand" "$DOCKHAND_INTERNAL_NETWORK" "$CONTAINERS_EXTERNAL_NETWORK"
+success "Verified Dockhand network isolation."
 
 if command -v curl >/dev/null 2>&1; then
   for i in {1..60}; do
@@ -719,6 +815,12 @@ Rootless Docker:
   Socket: $DOCKER_SOCKET
   DOCKER_HOST: $DOCKER_HOST
   Low-port binding: $LOW_PORTS, net.ipv4.ip_unprivileged_port_start=$LOW_PORT_START
+
+Dockhand networks:
+  PostgreSQL: $DOCKHAND_INTERNAL_NETWORK only
+  Dockhand app: $DOCKHAND_INTERNAL_NETWORK and $CONTAINERS_EXTERNAL_NETWORK only
+  Internal network: $DOCKHAND_INTERNAL_NETWORK
+  External network: $CONTAINERS_EXTERNAL_NETWORK
 
 Run Docker manually as the rootless user:
   sudo -iu $DOCKER_USER
