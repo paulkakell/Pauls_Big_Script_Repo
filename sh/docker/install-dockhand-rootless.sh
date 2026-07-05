@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="install-dockhand-rootless"
-SCRIPT_VERSION="2026.07.05"
+SCRIPT_VERSION="2026.07.05-r4"
 DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/paulkakell/Pauls_Big_Script_Repo/main/sh/docker/install-dockhand-rootless.sh"
 SCRIPT_URL="${SCRIPT_URL:-$DEFAULT_SCRIPT_URL}"
 LOCAL_SCRIPT="/usr/local/sbin/install-dockhand-rootless"
@@ -108,7 +108,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-install -d -m 0755 "$LOG_DIR"
+install -d -m 0755 "$LOG_DIR" "$CONF_DIR"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 info() { printf '%s[INFO]%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
@@ -214,6 +214,7 @@ self_update() {
   info "Downloading installer from $SCRIPT_URL"
   curl -fsSL "$SCRIPT_URL" -o "$tmp"
   bash -n "$tmp"
+  install -d -m 0755 "$(dirname "$LOCAL_SCRIPT")"
   install -m 0755 "$tmp" "$LOCAL_SCRIPT"
   rm -f "$tmp"
   success "Installed updated script at $LOCAL_SCRIPT"
@@ -429,13 +430,8 @@ INSTALL_STAGE="user"
 if getent group "$DOCKER_GROUP" >/dev/null; then
   EXISTING_GID="$(getent group "$DOCKER_GROUP" | cut -d: -f3)"
   if [[ "$EXISTING_GID" != "$DOCKER_GID" ]]; then
-    if getent group "$DOCKER_GID" >/dev/null; then
-      warn "Group $DOCKER_GROUP already exists with GID $EXISTING_GID. Requested GID $DOCKER_GID is unavailable. Using existing GID."
-      DOCKER_GID="$EXISTING_GID"
-    else
-      warn "Changing group $DOCKER_GROUP GID from $EXISTING_GID to $DOCKER_GID."
-      groupmod -g "$DOCKER_GID" "$DOCKER_GROUP"
-    fi
+    warn "Group $DOCKER_GROUP already exists with GID $EXISTING_GID. Using existing GID instead of requested GID $DOCKER_GID."
+    DOCKER_GID="$EXISTING_GID"
   fi
 else
   if getent group "$DOCKER_GID" >/dev/null; then
@@ -485,10 +481,11 @@ step "Configure host bind directory permissions"
 INSTALL_STAGE="paths"
 install -d -o "$DOCKER_USER" -g "$DOCKER_GROUP" -m "$HOST_DIR_MODE" "$HOST_PATH"
 install -d -o "$DOCKER_USER" -g "$DOCKER_GROUP" -m 0775 "$INSTALL_PATH"
-install -d -o "$DOCKER_USER" -g "$DOCKER_GROUP" -m 0775 "$DOCKHAND_DATA_PATH"
+install -d -o "$DOCKER_USER" -g "$DOCKER_GROUP" -m 0777 "$DOCKHAND_DATA_PATH"
 install -d -o "$DOCKER_USER" -g "$DOCKER_GROUP" -m 0777 "$POSTGRES_DATA_PATH"
 install -d -o root -g root -m 0700 "$SECRETS_DIR"
 chmod "$HOST_DIR_MODE" "$HOST_PATH"
+chmod 0777 "$DOCKHAND_DATA_PATH" "$POSTGRES_DATA_PATH"
 success "Prepared $HOST_PATH and $INSTALL_PATH."
 
 if is_yes "$LOW_PORTS"; then
@@ -550,24 +547,25 @@ success "Rootless Docker is running through $ROOTLESS_SERVICE."
 
 step "Create Docker context and installer configuration"
 INSTALL_STAGE="config"
+install -d -o root -g root -m 0755 "$CONF_DIR"
 as_docker_user docker context rm -f rootless >/dev/null 2>&1 || true
 as_docker_user docker context create rootless --description "Rootless Docker for $DOCKER_USER" --docker "host=$DOCKER_HOST" >/dev/null
 as_docker_user docker context use rootless >/dev/null 2>&1 || true
 
-cat > "$CONF_FILE" <<EOF
-SCRIPT_VERSION=$SCRIPT_VERSION
-SCRIPT_URL=$SCRIPT_URL
-DOCKER_USER=$DOCKER_USER
-DOCKER_GROUP=$DOCKER_GROUP
-DOCKER_UID=$DOCKER_REAL_UID
-DOCKER_GID=$DOCKER_REAL_GID
-DOCKER_HOST=$DOCKER_HOST
-ROOTLESS_SERVICE=$ROOTLESS_SERVICE
-HOST_PATH=$HOST_PATH
-INSTALL_PATH=$INSTALL_PATH
-DOCKHAND_PORT=$DOCKHAND_PORT
-COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME
-EOF
+{
+  printf 'SCRIPT_VERSION=%q\n' "$SCRIPT_VERSION"
+  printf 'SCRIPT_URL=%q\n' "$SCRIPT_URL"
+  printf 'DOCKER_USER=%q\n' "$DOCKER_USER"
+  printf 'DOCKER_GROUP=%q\n' "$DOCKER_GROUP"
+  printf 'DOCKER_UID=%q\n' "$DOCKER_REAL_UID"
+  printf 'DOCKER_GID=%q\n' "$DOCKER_REAL_GID"
+  printf 'DOCKER_HOST=%q\n' "$DOCKER_HOST"
+  printf 'ROOTLESS_SERVICE=%q\n' "$ROOTLESS_SERVICE"
+  printf 'HOST_PATH=%q\n' "$HOST_PATH"
+  printf 'INSTALL_PATH=%q\n' "$INSTALL_PATH"
+  printf 'DOCKHAND_PORT=%q\n' "$DOCKHAND_PORT"
+  printf 'COMPOSE_PROJECT_NAME=%q\n' "$COMPOSE_PROJECT_NAME"
+} > "$CONF_FILE"
 chmod 0644 "$CONF_FILE"
 
 if is_yes "$INSTALL_SELF_UPDATER"; then
