@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="install-dockhand-rootless"
-SCRIPT_VERSION="2026.07.05-r6-networks"
+SCRIPT_VERSION="2026.07.05-r7-networks"
 DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/paulkakell/Pauls_Big_Script_Repo/main/sh/docker/install-dockhand-rootless.sh"
 SCRIPT_URL="${SCRIPT_URL:-$DEFAULT_SCRIPT_URL}"
 LOCAL_SCRIPT="/usr/local/sbin/install-dockhand-rootless"
@@ -348,6 +348,22 @@ ensure_docker_network() {
   fi
 }
 
+container_networks_sorted() {
+  local container="$1"
+
+  as_docker_user docker inspect \
+    -f '{{range $name, $_ := .NetworkSettings.Networks}}{{printf "%s\n" $name}}{{end}}' \
+    "$container" 2>/dev/null \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' \
+    | LC_ALL=C sort -u
+}
+
+normalize_network_list() {
+  sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' \
+    | LC_ALL=C sort -u \
+    | awk '{ out = out (out ? " " : "") $0 } END { print out }'
+}
+
 prune_container_networks() {
   local container="$1"
   shift
@@ -359,7 +375,7 @@ prune_container_networks() {
     if [[ "$allowed" != *" $network "* ]]; then
       as_docker_user docker network disconnect "$network" "$container" >/dev/null 2>&1 || true
     fi
-  done < <(as_docker_user docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$container" 2>/dev/null || true)
+  done < <(container_networks_sorted "$container" || true)
 }
 
 assert_container_networks() {
@@ -368,11 +384,8 @@ assert_container_networks() {
   local expected=""
   local actual=""
 
-  expected="$(printf '%s
-' "$@" | LC_ALL=C sort | tr '
-' ' ' | sed 's/[[:space:]]*$//')"
-  actual="$(as_docker_user docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$container" | LC_ALL=C sort | tr '
-' ' ' | sed 's/[[:space:]]*$//')"
+  expected="$(printf '%s\n' "$@" | normalize_network_list)"
+  actual="$(container_networks_sorted "$container" | normalize_network_list)"
 
   if [[ "$actual" != "$expected" ]]; then
     fatal "$container network mismatch. Expected: ${expected:-none}. Actual: ${actual:-none}."
@@ -432,7 +445,7 @@ if [[ "$ROLLBACK_ON_FAIL" == "unset" ]]; then
   ROLLBACK_ON_FAIL="$(ask_yes_no "Rollback Dockhand stack if deployment fails" "yes")"
 fi
 
-POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(random_password)}"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
 
 validate_username "$DOCKER_USER"
 validate_numeric "User UID" "$DOCKER_UID"
@@ -472,6 +485,20 @@ SECRETS_DIR="$INSTALL_PATH/secrets"
 ENV_FILE="$INSTALL_PATH/.env"
 COMPOSE_FILE="$INSTALL_PATH/docker-compose.yml"
 PASSWORD_FILE="$SECRETS_DIR/postgres-password.txt"
+
+if [[ -n "$POSTGRES_PASSWORD" ]]; then
+  info "Using PostgreSQL password supplied through POSTGRES_PASSWORD."
+elif [[ -f "$PASSWORD_FILE" ]]; then
+  POSTGRES_PASSWORD="$(tr -d '\r\n' < "$PASSWORD_FILE")"
+  if [[ -n "$POSTGRES_PASSWORD" ]]; then
+    info "Reusing existing PostgreSQL password from $PASSWORD_FILE."
+  else
+    POSTGRES_PASSWORD="$(random_password)"
+    warn "Existing PostgreSQL password file was empty. Generated a new password."
+  fi
+else
+  POSTGRES_PASSWORD="$(random_password)"
+fi
 
 step "Validate operating system and runtime"
 INSTALL_STAGE="validate"
@@ -773,10 +800,13 @@ as_docker_user bash -lc 'cd "$1" && docker compose pull && docker compose up -d 
 step "Verify deployment"
 INSTALL_STAGE="verify"
 for i in {1..90}; do
-  if as_docker_user docker inspect -f '{{.State.Running}}' dockhand-postgres >/dev/null 2>&1 && \
-     as_docker_user docker inspect -f '{{.State.Running}}' dockhand >/dev/null 2>&1; then
+  POSTGRES_RUNNING="$(as_docker_user docker inspect -f '{{.State.Running}}' dockhand-postgres 2>/dev/null || true)"
+  DOCKHAND_RUNNING="$(as_docker_user docker inspect -f '{{.State.Running}}' dockhand 2>/dev/null || true)"
+
+  if [[ "$POSTGRES_RUNNING" == "true" && "$DOCKHAND_RUNNING" == "true" ]]; then
     break
   fi
+
   sleep 2
   if [[ "$i" == "90" ]]; then
     as_docker_user bash -lc 'cd "$1" && docker compose ps && docker compose logs --tail=120' _ "$INSTALL_PATH" || true
